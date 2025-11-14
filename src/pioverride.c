@@ -13,6 +13,8 @@
 //
 //  ==============================================================================================
 
+#include <float.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -49,6 +51,10 @@ static struct {
     int  pluginState;                      // always have this in .cfg file:  0=disabled 1=enabled
     char cvar[10][CFS_FETCH_MAX];          // array of 10 [<gamemodeproperties> <value>]
     int  pokeEveryRound;
+    int  overrideEnemyCount;
+    int  minimumEnemies;
+    int  maximumEnemies;
+    double counterAttackEnemyMultiplier;
 
 } pioverrideConfig;
 
@@ -85,7 +91,14 @@ int pioverrideInitConfig( void )
     // the server at start of every round.  Otherwise, it is only programmed at start of 
     // every game.
     //
+    // it also controls if the enemy count is overridden at the start of each round.
+    //
     pioverrideConfig.pokeEveryRound = (int) cfsFetchNum( cP, "pioverride.pokeEveryRound", 0 );
+
+    pioverrideConfig.overrideEnemyCount = (int) cfsFetchNum( cP, "pioverride.overrideEnemyCount", 0 );
+    pioverrideConfig.minimumEnemies = (int) cfsFetchNum( cP, "pioverride.minimumEnemies", 0 );
+    pioverrideConfig.maximumEnemies = (int) cfsFetchNum( cP, "pioverride.maximumEnemies", 0 );
+    pioverrideConfig.counterAttackEnemyMultiplier = (double) cfsFetchNum( cP, "pioverride.counterAttackEnemyMultiplier", 0.0 );
 
     cfsDestroy( cP );
     return 0;
@@ -122,6 +135,45 @@ static void _pokeCvar( void )
         }
     }
     return;
+}
+
+//  ==============================================================================================
+//  _overrideEnemyCount
+//
+//  Override the enemy count using `gamemodeproperty minimumenemies` and
+//  `gamemodeproperty maximumenemies` RCON commands, with an option to set an enemy count
+//  multiplier for counterattacks.
+//
+//  This method is called at start of each game, and optionally at the start of each round. It is
+//  also called when a counterattack starts/ends if counterAttackEnemyMultiplier is set and not
+//  1.0.
+//  
+//
+static void _overrideEnemyCount( int isCounterAttack )
+{
+    if ( pioverrideConfig.overrideEnemyCount && pioverrideConfig.minimumEnemies && pioverrideConfig.maximumEnemies ) {
+        if ( isCounterAttack != 0 && isCounterAttack != 1 ) {
+            isCounterAttack = apiIsCounterAttack() ? 1 : 0;
+        } 
+
+        int minimumEnemies = pioverrideConfig.minimumEnemies;
+        int maximumEnemies = pioverrideConfig.maximumEnemies;
+        double counterAttackEnemyMultiplier = pioverrideConfig.counterAttackEnemyMultiplier ? pioverrideConfig.counterAttackEnemyMultiplier : 1.0;
+        char minBuf[256];
+        char maxBuf[256];
+
+        if ( isCounterAttack ) {
+            minimumEnemies = (int) ceil( minimumEnemies * counterAttackEnemyMultiplier );
+            maximumEnemies = (int) ceil( maximumEnemies * counterAttackEnemyMultiplier );
+        }
+        
+        sprintf( minBuf, "%d", minimumEnemies );
+        sprintf( maxBuf, "%d", maximumEnemies );
+        apiGameModePropertySet( "minimumenemies", minBuf );
+        apiGameModePropertySet( "maximumenemies", maxBuf );
+        logPrintf( LOG_LEVEL_INFO, "pioverride", "Overriding enemy count: %d %d with counterattack status %d", minimumEnemies, maximumEnemies, isCounterAttack );
+
+    }
 }
 
 //  ==============================================================================================
@@ -182,12 +234,13 @@ int pioverrideMapChangeCB( char *strIn )
 //  ==============================================================================================
 //  pioverrideGameStartCB
 //
-//  Update the override gamemodeproperties at start of game.
+//  Update the override gamemodeproperties, and override the enemy count at start of game.
 // 
 //
 int pioverrideGameStartCB( char *strIn )
 {
      _pokeCvar();
+     _overrideEnemyCount(/*isCounterAttack=*/0);
     return 0;
 }
 
@@ -205,12 +258,15 @@ int pioverrideGameEndCB( char *strIn )
 //  ==============================================================================================
 //  pioverrideRoundStartCB
 //
-//  Optionally update the override gamemodeproperties at start of game.
+//  Optionally update the override gamemodeproperties, and override the enemy count at start of
+//  game.
 //
 int pioverrideRoundStartCB( char *strIn )
 {
-    if ( pioverrideConfig.pokeEveryRound ) 
+    if ( pioverrideConfig.pokeEveryRound ) {
         _pokeCvar();
+        _overrideEnemyCount(/*isCounterAttack=*/0);
+    }
 
     return 0;
 }
@@ -234,6 +290,30 @@ int pioverrideRoundEndCB( char *strIn )
 //
 int pioverrideCapturedCB( char *strIn )
 {
+    return 0;
+}
+
+//  ==============================================================================================
+//  pioverrideCAStartCB
+//
+//  Override the enemy count when a counterattack starts.
+//
+int pioverrideCAStartCB( char *strIn )
+{
+    if ( pioverrideConfig.counterAttackEnemyMultiplier && fabs(pioverrideConfig.counterAttackEnemyMultiplier - 1.0) > DBL_EPSILON )
+        _overrideEnemyCount(/*isCounterAttack=*/1);
+    return 0;
+}
+
+//  ==============================================================================================
+//  pioverrideCAStopCB
+//
+//  Override the enemy count when a counterattack ends.
+//
+int pioverrideCAStopCB( char *strIn )
+{
+    if ( pioverrideConfig.counterAttackEnemyMultiplier && fabs(pioverrideConfig.counterAttackEnemyMultiplier - 1.0) > DBL_EPSILON )
+        _overrideEnemyCount(/*isCounterAttack=*/0);
     return 0;
 }
 
@@ -279,6 +359,8 @@ int pioverrideInstallPlugin( void )
     eventsRegister( SISSM_EV_ROUND_START,          pioverrideRoundStartCB );
     eventsRegister( SISSM_EV_ROUND_END,            pioverrideRoundEndCB );
     eventsRegister( SISSM_EV_OBJECTIVE_CAPTURED,   pioverrideCapturedCB );
+    eventsRegister( SISSM_EV_ACTIVITY,             pioverrideCAStartCB );
+    eventsRegister( SISSM_EV_CA_STOP,              pioverrideCAStopCB );
     eventsRegister( SISSM_EV_PERIODIC,             pioverridePeriodicCB );
     return 0;
 }
